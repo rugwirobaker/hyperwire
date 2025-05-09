@@ -1,0 +1,9 @@
+[package]
+name = "fribra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+etherparse = "0.18.0"
+rand = "0.9.1"
+tun-tap = "0.1.4"
