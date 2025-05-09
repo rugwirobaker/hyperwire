@@ -44,15 +44,15 @@ enum TcpState {
     Established,
     // FinWait1,
     // FinWait2,
-    // CloseWait,
-    // LastAck,
+    CloseWait,
+    LastAck,
     // TimeWait,
 }
 
 #[derive(Debug)]
 struct TcpConnection {
     state: TcpState,
-    send_isn: u32,
+    server_isn: u32,
     recv_next: u32,
     send_next: u32,
     recv_buffer: Vec<u8>, // data we’ve received
@@ -60,11 +60,11 @@ struct TcpConnection {
 }
 
 impl TcpConnection {
-    fn new_syn_received(isn: u32, client_isn: u32) -> Self {
+    fn new_syn_received(server_isn: u32, client_isn: u32) -> Self {
         TcpConnection {
             state: TcpState::SynReceived,
-            send_isn: isn,
-            send_next: isn.wrapping_add(1), // we consumed one for SYN
+            server_isn,
+            send_next: server_isn.wrapping_add(1), // we consumed one for SYN
             recv_next: client_isn.wrapping_add(1),
             recv_buffer: Vec::new(),
             send_buffer: Vec::new(),
@@ -171,32 +171,35 @@ fn main() {
                 payload,
             );
 
-            // If we've moved recv_next, send an ACK
+            // 2b) If new data arrived, send pure ACK
             if conn.state == TcpState::Established && conn.recv_next != prev_recv {
                 let ack_num = conn.recv_next;
                 let win = conn.advertised_window();
                 let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                    .tcp(
-                        rkey.src_port,
-                        rkey.dst_port,
-                        conn.send_next, // our next seq (still ISN+1 if no data yet)
-                        win,
-                    )
+                    .tcp(rkey.src_port, rkey.dst_port, conn.send_next, win)
                     .ack(ack_num);
-
                 let mut ack_pkt = Vec::with_capacity(builder.size(0));
                 builder.write(&mut ack_pkt, &[]).unwrap();
                 dev.send(&ack_pkt).unwrap();
                 println!("  ← Sent ACK for recv_next={}", ack_num);
             }
 
+            // 3) Application logic: detect newline delimiter, enqueue for echo
+            if conn.state == TcpState::Established && conn.send_buffer.is_empty() {
+                if let Some(pos) = conn.recv_buffer.iter().position(|&b| b == b'\n') {
+                    let line = conn.recv_buffer.drain(..=pos).collect::<Vec<u8>>();
+                    conn.send_buffer.extend_from_slice(&line);
+                    println!("📥 Buffered for echo: {:?}", String::from_utf8_lossy(&line));
+                }
+            }
+
+            // 4) Echo branch: PSH+ACK for queued data
             if conn.state == TcpState::Established && !conn.send_buffer.is_empty() {
-                // send up to MSS worth of data
                 let mss = 1460;
                 let to_send = conn
                     .send_buffer
                     .drain(..mss.min(conn.send_buffer.len()))
-                    .collect::<Vec<_>>();
+                    .collect::<Vec<u8>>();
                 let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
                     .tcp(
                         rkey.src_port,
@@ -206,12 +209,46 @@ fn main() {
                     )
                     .psh()
                     .ack(conn.recv_next);
-
                 let mut data_pkt = Vec::with_capacity(builder.size(to_send.len()));
                 builder.write(&mut data_pkt, &to_send).unwrap();
                 dev.send(&data_pkt).unwrap();
                 conn.send_next = conn.send_next.wrapping_add(to_send.len() as u32);
-                println!("  → Sent {} bytes of response", to_send.len());
+                println!("  → Echoed {} bytes", to_send.len());
+            }
+
+            // 5) Handle peer FIN → close after echoing
+            if (flags & FIN) != 0 {
+                // move into CloseWait
+                conn.state = TcpState::CloseWait;
+                println!("⚓ Received FIN, entering CloseWait");
+            }
+
+            if conn.state == TcpState::CloseWait && conn.send_buffer.is_empty() {
+                // send our FIN+ACK
+                let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+                    .tcp(
+                        rkey.src_port,
+                        rkey.dst_port,
+                        conn.send_next,
+                        conn.advertised_window(),
+                    )
+                    .fin()
+                    .ack(conn.recv_next);
+                let mut fin_pkt = Vec::with_capacity(builder.size(0));
+                builder.write(&mut fin_pkt, &[]).unwrap();
+                dev.send(&fin_pkt).unwrap();
+                conn.send_next = conn.send_next.wrapping_add(1);
+                conn.state = TcpState::LastAck;
+                println!("⚓ Sent FIN, entering LastAck");
+            }
+
+            // 6) Teardown: wait for their final ACK to our FIN
+            if conn.state == TcpState::LastAck
+                && (flags & ACK) != 0
+                && tcp.acknowledgment_number() == conn.send_next
+            {
+                table.remove(&key);
+                println!("🗑️ Connection torn down");
             }
         }
     }
