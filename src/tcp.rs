@@ -3,7 +3,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
-use tun_tap::{self, Iface, Mode};
+
+use crate::Device;
 
 const SYN: u8 = 1 << 1;
 const ACK: u8 = 1 << 4;
@@ -12,7 +13,7 @@ const RST: u8 = 1 << 2;
 const PSH: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TcpKey {
+pub struct TcpKey {
     src_ip: Ipv4Addr,
     src_port: u16,
     dst_ip: Ipv4Addr,
@@ -30,7 +31,7 @@ impl std::fmt::Display for TcpKey {
 }
 
 impl TcpKey {
-    fn new(ip: &Ipv4HeaderSlice, tcp: &TcpHeaderSlice) -> Self {
+    pub fn new(ip: &Ipv4HeaderSlice, tcp: &TcpHeaderSlice) -> Self {
         TcpKey {
             src_ip: ip.source_addr(),
             src_port: tcp.source_port(),
@@ -39,7 +40,7 @@ impl TcpKey {
         }
     }
 
-    fn reverse(&self) -> Self {
+    pub fn reverse(&self) -> Self {
         TcpKey {
             src_ip: self.dst_ip,
             src_port: self.dst_port,
@@ -50,7 +51,7 @@ impl TcpKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpState {
+pub enum TcpState {
     // Closed,
     Listen,
     SynReceived,
@@ -75,7 +76,7 @@ impl std::fmt::Display for TcpState {
 }
 
 impl TcpState {
-    fn on_event(self, ev: TcpEvent) -> Option<TcpState> {
+    pub fn on_event(self, ev: TcpEvent) -> Option<TcpState> {
         use TcpEvent::*;
         use TcpState::*;
         match (self, ev) {
@@ -89,7 +90,7 @@ impl TcpState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpEvent {
+pub enum TcpEvent {
     RecvSyn, // incoming SYN without ACK
     RecvAck, // pure ACK
     RecvFin, // incoming FIN
@@ -106,25 +107,25 @@ impl std::fmt::Display for TcpEvent {
 }
 
 #[derive(Debug)]
-struct TcpConnection {
+pub struct TcpConnection {
     id: u64,
     state: TcpState,
-    server_isn: u32,
+    pub server_isn: u32,
     recv_next: u32,
     send_next: u32,
-    recv_buffer: Vec<u8>, // data we’ve received
-    send_buffer: Vec<u8>, // data waiting to be sent
+    recv_buffer: Vec<u8>,     // data we’ve received
+    pub send_buffer: Vec<u8>, // data waiting to be sent
     reasm_buf: BTreeMap<u32, Vec<u8>>,
     // debugging
-    created_at: Instant,
+    pub created_at: Instant,
     established_at: Option<Instant>,
     bytes_received: usize,
-    bytes_sent: usize,
+    pub bytes_sent: usize,
 }
 
 impl TcpConnection {
     /// Create an initial listener-state connection
-    fn new_listen(id: u64) -> Self {
+    pub fn new_listen(id: u64) -> Self {
         TcpConnection {
             id,
             state: TcpState::Listen,
@@ -140,19 +141,9 @@ impl TcpConnection {
             bytes_sent: 0,
         }
     }
-    // fn new_syn_received(server_isn: u32, client_isn: u32) -> Self {
-    //     TcpConnection {
-    //         state: TcpState::SynReceived;,
-    //         server_isn,
-    //         send_next: server_isn.wrapping_add(1);, // we consumed one for SYN
-    //         recv_next: client_isn.wrapping_add(1);,
-    //         recv_buffer: Vec::new();,
-    //         send_buffer: Vec::new();,
-    //         reasm_buf: BTreeMap::new();,
-    //     }
-    // }
-    // Transition helper stub:
-    fn on_segment(&mut self, key: &TcpKey, flags: u8, seq: u32, ack: u32, payload: &[u8]) {
+
+    // on_segment is called whenever we receive a new segment
+    pub fn on_segment(&mut self, key: &TcpKey, flags: u8, seq: u32, ack: u32, payload: &[u8]) {
         // Log incoming packet details
         let flags_str = format!(
             "{}{}{}{}{}",
@@ -276,12 +267,12 @@ impl TcpConnection {
     }
 
     /// For our SYN-ACK, we’ll just advertise a constant window for now.
-    fn advertised_window(&self) -> u16 {
+    pub fn advertised_window(&self) -> u16 {
         65_535 // max unscaled window
     }
 
     /// Only moves payload into recv_buffer & updates recv_next.
-    fn accept_payload(&mut self, data: &[u8]) {
+    pub fn accept_payload(&mut self, data: &[u8]) {
         self.recv_buffer.extend_from_slice(data);
         self.recv_next = self.recv_next.wrapping_add(data.len() as u32);
         self.bytes_received += data.len();
@@ -294,28 +285,40 @@ impl TcpConnection {
     }
 }
 
-fn main() {
-    // Open the existing tun0 we created by hand
-    let dev = Iface::without_packet_info("tun0", Mode::Tun).expect("failed to open tun0");
-    // creates /dev/net/tun, name "tun0" :contentReference[oaicite:0]{index=0}
+pub struct Server {
+    device: Box<dyn Device>,
+    connections: HashMap<TcpKey, TcpConnection>,
+    conn_counter: u64,
+}
 
-    println!("Listening on tun0 …");
-    let mut conn_counter = 0u64;
-    // let start_time = Instant::now();
+impl Server {
+    pub fn new(device: Box<dyn Device>) -> Self {
+        Self {
+            device,
+            connections: HashMap::new(),
+            conn_counter: 0,
+        }
+    }
 
-    let mut table: HashMap<TcpKey, TcpConnection> = HashMap::new();
+    pub fn run(&mut self) {
+        let mut buf = [0u8; 1504];
+        loop {
+            let n = match self.device.recv(&mut buf) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            self.handle_packet(&buf[..n]);
+        }
+    }
 
-    let mut buf = [0u8; 1504]; // MTU + 4 bytes for headroom
-
-    loop {
-        let n = dev.recv(&mut buf).unwrap();
-        let ip = match Ipv4HeaderSlice::from_slice(&buf[..n]) {
+    pub fn handle_packet(&mut self, packet: &[u8]) {
+        let ip = match Ipv4HeaderSlice::from_slice(&packet) {
             Ok(h) if h.protocol() == IpNumber::from(6) => h,
-            _ => continue,
+            _ => return,
         };
-        let tcp = match TcpHeaderSlice::from_slice(&buf[ip.slice().len()..n]) {
+        let tcp = match TcpHeaderSlice::from_slice(&packet[ip.slice().len()..]) {
             Ok(h) => h,
-            _ => continue,
+            _ => return,
         };
 
         let key = TcpKey::new(&ip, &tcp);
@@ -334,15 +337,15 @@ fn main() {
                        tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst(), tcp.psh());
 
         // 1) New connection SYN (FSM-driven)
-        if !table.contains_key(&key) && flags == SYN {
-            conn_counter += 1;
+        if !self.connections.contains_key(&key) && flags == SYN {
+            self.conn_counter += 1;
             let client_isn = tcp.sequence_number();
             let server_isn = rand::random();
 
-            println!("\n🎯 New connection #{} from {}", conn_counter, key);
+            println!("\n🎯 New connection #{} from {}", self.conn_counter, key);
             println!("   Client ISN: {}, Server ISN: {}", client_isn, server_isn);
 
-            let mut conn = TcpConnection::new_listen(conn_counter);
+            let mut conn = TcpConnection::new_listen(self.conn_counter);
             // trigger Listen->SynReceived
             if let Some(ns) = conn.state.on_event(TcpEvent::RecvSyn) {
                 conn.state = ns;
@@ -350,37 +353,34 @@ fn main() {
                 conn.send_next = server_isn.wrapping_add(1);
                 conn.recv_next = client_isn.wrapping_add(1);
             }
+
             // send SYN-ACK
             let win = conn.advertised_window();
             let ackn = client_isn.wrapping_add(1);
-
             println!(
                 "[#{}] {} TX: flags=SA- seq={} ack={} win={}",
-                conn_counter, rkey, server_isn, ackn, win
+                self.conn_counter, rkey, server_isn, ackn, win
             );
-
-            let mut pkt = Vec::with_capacity(
-                PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                    .tcp(rkey.src_port, rkey.dst_port, server_isn, win)
-                    .syn()
-                    .ack(ackn)
-                    .size(0),
-            );
-            PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                .tcp(rkey.src_port, rkey.dst_port, server_isn, win)
+            let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+                .tcp(
+                    rkey.src_port,
+                    rkey.dst_port,
+                    conn.server_isn,
+                    conn.advertised_window(),
+                )
                 .syn()
-                .ack(ackn)
-                .write(&mut pkt, &[])
-                .unwrap();
-            dev.send(&pkt).unwrap();
-            table.insert(key, conn);
-            continue;
+                .ack(ackn);
+            let mut pkt = Vec::with_capacity(builder.size(0));
+            builder.write(&mut pkt, &[]).unwrap();
+            self.device.send(&pkt).unwrap();
+            self.connections.insert(key, conn);
+            return;
         }
 
         // 2) Existing connection
-        if let Some(conn) = table.get_mut(&key) {
+        if let Some(conn) = self.connections.get_mut(&key) {
             let off = ip.slice().len() + tcp.slice().len();
-            let payload = &buf[off..n];
+            let payload = &packet[off..];
 
             conn.on_segment(
                 &key,
@@ -399,28 +399,17 @@ fn main() {
                     conn.id, rkey, conn.send_next, conn.recv_next
                 );
 
-                let mut pkt = Vec::with_capacity(
-                    PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                        .tcp(
-                            rkey.src_port,
-                            rkey.dst_port,
-                            conn.send_next,
-                            conn.advertised_window(),
-                        )
-                        .ack(conn.recv_next)
-                        .size(0),
-                );
-                PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+                let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
                     .tcp(
                         rkey.src_port,
                         rkey.dst_port,
                         conn.send_next,
                         conn.advertised_window(),
                     )
-                    .ack(conn.recv_next)
-                    .write(&mut pkt, &[])
-                    .unwrap();
-                dev.send(&pkt).unwrap();
+                    .ack(conn.recv_next);
+                let mut pkt = Vec::with_capacity(builder.size(0));
+                builder.write(&mut pkt, &[]).unwrap();
+                self.device.send(&pkt).unwrap();
             }
 
             // Prepare echo data on newline
@@ -447,19 +436,8 @@ fn main() {
                     conn.recv_next,
                     chunk.len()
                 );
-                let mut pkt = Vec::with_capacity(
-                    PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                        .tcp(
-                            rkey.src_port,
-                            rkey.dst_port,
-                            conn.send_next,
-                            conn.advertised_window(),
-                        )
-                        .psh()
-                        .ack(conn.recv_next)
-                        .size(chunk.len()),
-                );
-                PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+
+                let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
                     .tcp(
                         rkey.src_port,
                         rkey.dst_port,
@@ -467,10 +445,11 @@ fn main() {
                         conn.advertised_window(),
                     )
                     .psh()
-                    .ack(conn.recv_next)
-                    .write(&mut pkt, &chunk)
-                    .unwrap();
-                dev.send(&pkt).unwrap();
+                    .ack(conn.send_next);
+                let mut pkt = Vec::with_capacity(builder.size(chunk.len()));
+                builder.write(&mut pkt, &chunk).unwrap();
+                self.device.send(&pkt).unwrap();
+
                 // conn.send_next = conn.send_next.wrapping_add(chunk.len() as u32);
                 if let Ok(text) = std::str::from_utf8(&chunk) {
                     if !text.chars().all(char::is_whitespace) {
@@ -489,28 +468,18 @@ fn main() {
                     "[#{}] {} TX: flags=-A-- seq={} ack={} (ACK for FIN)",
                     conn.id, rkey, conn.send_next, conn.recv_next
                 );
-                let mut fin_ack = Vec::with_capacity(
-                    PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                        .tcp(
-                            rkey.src_port,
-                            rkey.dst_port,
-                            conn.send_next,
-                            conn.advertised_window(),
-                        )
-                        .ack(conn.recv_next)
-                        .size(0),
-                );
-                PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+
+                let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
                     .tcp(
                         rkey.src_port,
                         rkey.dst_port,
                         conn.send_next,
                         conn.advertised_window(),
                     )
-                    .ack(conn.recv_next)
-                    .write(&mut fin_ack, &[])
-                    .unwrap();
-                dev.send(&fin_ack).unwrap();
+                    .ack(conn.recv_next);
+                let mut ack = Vec::with_capacity(builder.size(0));
+                builder.write(&mut ack, &[]).unwrap();
+                self.device.send(&ack).unwrap();
                 println!("  ← Sent ACK for FIN (recv_next={})", conn.recv_next);
             }
 
@@ -521,19 +490,7 @@ fn main() {
                     conn.id, rkey, conn.send_next, conn.recv_next
                 );
 
-                let mut fin_pkt = Vec::with_capacity(
-                    PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
-                        .tcp(
-                            rkey.src_port,
-                            rkey.dst_port,
-                            conn.send_next,
-                            conn.advertised_window(),
-                        )
-                        .fin()
-                        .ack(conn.recv_next)
-                        .size(0),
-                );
-                PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+                let builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
                     .tcp(
                         rkey.src_port,
                         rkey.dst_port,
@@ -541,15 +498,15 @@ fn main() {
                         conn.advertised_window(),
                     )
                     .fin()
-                    .ack(conn.recv_next)
-                    .write(&mut fin_pkt, &[])
-                    .unwrap();
-                dev.send(&fin_pkt).unwrap();
+                    .ack(conn.recv_next);
+                let mut fin_pkt = Vec::with_capacity(builder.size(0));
+                builder.write(&mut fin_pkt, &[]).unwrap();
+                self.device.send(&fin_pkt).unwrap();
                 conn.send_next = conn.send_next.wrapping_add(1);
                 conn.state = TcpState::LastAck;
             }
 
-            // Connection teardown
+            // Close connection
             if conn.state == TcpState::LastAck
                 && (flags & ACK) != 0
                 && tcp.acknowledgment_number() == conn.send_next
@@ -571,16 +528,15 @@ fn main() {
                 println!("   State: {} → CLOSED", conn.state);
                 println!("🔚 Connection #{} closed\n", conn.id);
 
-                table.remove(&key);
+                self.connections.remove(&key);
             }
         }
         // Handle RST flag
         if flags & RST != 0 {
-            if let Some(conn) = table.get(&key) {
+            if let Some(conn) = self.connections.get(&key) {
                 println!("\n⚠️  RST received for connection #{}", conn.id);
             }
-            table.remove(&key);
-            continue;
+            self.connections.remove(&key);
         }
     }
 }

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-etherparse = "0.18.0"
-rand = "0.9.1"
+etherparse = "0.15.0"
 tun-tap = "0.1.4"
+rand = "0.8.5"
+nix = { version = "0.30", features = ["socket", "net"] }
+libc = "0.2"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
