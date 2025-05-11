@@ -1,4 +1,4 @@
-use fribra::{Server, Tun};
+use hyperwire::{Server, Tun};
 
 fn main() {
     println!("Listening on tun0 …");
