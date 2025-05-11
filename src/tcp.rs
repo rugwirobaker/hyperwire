@@ -445,7 +445,7 @@ impl Server {
                         conn.advertised_window(),
                     )
                     .psh()
-                    .ack(conn.send_next);
+                    .ack(conn.recv_next);
                 let mut pkt = Vec::with_capacity(builder.size(chunk.len()));
                 builder.write(&mut pkt, &chunk).unwrap();
                 self.device.send(&pkt).unwrap();
