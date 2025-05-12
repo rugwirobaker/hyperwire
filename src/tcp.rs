@@ -128,23 +128,23 @@ pub struct RetransmitSegment {
 pub struct TcpConnection {
     id: u64,
     state: TcpState,
-    pub server_isn: u32,
+    server_isn: u32,
     recv_next: u32,
     send_next: u32,
-    recv_buffer: Vec<u8>,     // data we’ve received
-    pub send_buffer: Vec<u8>, // data waiting to be sent
+    recv_buffer: Vec<u8>, // data we’ve received
+    send_buffer: Vec<u8>, // data waiting to be sent
     reasm_buf: BTreeMap<u32, Vec<u8>>,
     // debugging
-    pub created_at: Instant,
+    created_at: Instant,
     established_at: Option<Instant>,
     bytes_received: usize,
-    pub bytes_sent: usize,
+    bytes_sent: usize,
     // retransmission
     rto: Duration,          // Current RTO value
     srtt: Option<Duration>, // Smoothed RTT
     rttvar: Duration,       // RTT variance
     // New retransmission queue - key is starting sequence number
-    pub retransmit_queue: BTreeMap<u32, RetransmitSegment>,
+    retransmit_queue: BTreeMap<u32, RetransmitSegment>,
 }
 
 impl TcpConnection {
