@@ -12,7 +12,6 @@ const FIN: u8 = 1 << 0;
 const RST: u8 = 1 << 2;
 const PSH: u8 = 1 << 3;
 
-// Add these constants at the top of tcp.rs
 const INITIAL_RTO: Duration = Duration::from_millis(1000); // 1 second initial RTO
 const MIN_RTO: Duration = Duration::from_millis(200); // 200ms minimum RTO
 const MAX_RTO: Duration = Duration::from_secs(60); // 60 seconds maximum RTO
@@ -124,6 +123,26 @@ pub struct RetransmitSegment {
     pub ack: u32,             // ACK number (if ACK flag is set)
 }
 
+impl RetransmitSegment {
+    pub fn new(
+        seq: u32,
+        retransmit_count: u8,
+        sent_at: Instant,
+        flags: u8,
+        data: Vec<u8>,
+        ack: u32,
+    ) -> Self {
+        RetransmitSegment {
+            data,
+            seq,
+            sent_at,
+            retransmit_count,
+            flags,
+            ack,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpConnection {
     id: u64,
@@ -173,7 +192,6 @@ impl TcpConnection {
 
     // on_segment is called whenever we receive a new segment
     pub fn on_segment(&mut self, key: &TcpKey, flags: u8, seq: u32, ack: u32, payload: &[u8]) {
-        // Log incoming packet details
         let flags_str = format!(
             "{}{}{}{}{}",
             if flags & SYN != 0 { "S" } else { "-" },
@@ -192,7 +210,7 @@ impl TcpConnection {
             ack,
             payload.len()
         );
-        // 1) FSM-driven state transition
+
         let event = if flags & SYN != 0 && flags & ACK == 0 {
             println!(
                 "[#{}] {} ▶ New SYN received, initiating handshake",
@@ -295,12 +313,12 @@ impl TcpConnection {
         }
     }
 
-    /// For our SYN-ACK, we’ll just advertise a constant window for now.
+    /// advertising a constant window for now.
     pub fn advertised_window(&self) -> u16 {
         65_535 // max unscaled window
     }
 
-    /// Only moves payload into recv_buffer & updates recv_next.
+    /// accept_payload into the recv_buffer
     pub fn accept_payload(&mut self, data: &[u8]) {
         self.recv_buffer.extend_from_slice(data);
         self.recv_next = self.recv_next.wrapping_add(data.len() as u32);
@@ -315,7 +333,7 @@ impl TcpConnection {
 }
 
 impl TcpConnection {
-    // Calculate new RTO when an RTT measurement is made
+    /// Calculates new RTO when an RTT measurement is made
     pub fn update_rto(&mut self, measured_rtt: Duration) {
         println!(
             "[#{}] 📊 RTT measurement: {:?}, current RTO: {:?}",
@@ -370,14 +388,9 @@ impl TcpConnection {
 
     // Add a segment to the retransmission queue
     pub fn queue_for_retransmit(&mut self, seq: u32, flags: u8, ack: u32, data: Vec<u8>) {
-        let segment = RetransmitSegment {
-            data,
-            seq,
-            sent_at: Instant::now(),
-            retransmit_count: 0,
-            flags,
-            ack,
-        };
+        let sent_at = Instant::now();
+        let segment = RetransmitSegment::new(seq, flags, sent_at, 0, data, ack);
+
         println!(
             "[#{}] 📦 Queueing for potential retransmit: seq={}, len={}, flags={:02b}",
             self.id,
@@ -440,7 +453,7 @@ impl TcpConnection {
         to_retransmit
     }
 
-    // process_ack is called when we receive an ACK, remove acknowledged segments from retransmit queue
+    /// Remove acknowledged segments from retransmit queue
     pub fn process_ack(&mut self, ack_num: u32) {
         let mut segments_to_remove = Vec::new();
         let mut rtt_measurements = Vec::new();
@@ -547,7 +560,7 @@ impl Server {
                        key.src_ip, key.src_port, key.dst_ip, key.dst_port, flags,
                        tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst(), tcp.psh());
 
-        // 1) New connection SYN (FSM-driven)
+        // 1) New connection SYN
         if !self.connections.contains_key(&key) && flags == SYN {
             self.conn_counter += 1;
             let client_isn = tcp.sequence_number();
@@ -649,7 +662,7 @@ impl Server {
                 }
             }
 
-            // echo data
+            // build and send data packet
             if conn.state == TcpState::Established && !conn.send_buffer.is_empty() {
                 let chunk = conn.send_buffer.drain(..).collect::<Vec<_>>();
                 println!(
@@ -775,7 +788,7 @@ impl Server {
                 self.connections.remove(&key);
             }
         }
-        // Handle RST flag: they said to shove it wherever
+        // 7) Handle RST flag: they said to shove it wherever
         if flags & RST != 0 {
             if let Some(conn) = self.connections.get(&key) {
                 println!("\n⚠️  RST received for connection #{}", conn.id);
