@@ -12,6 +12,14 @@ const FIN: u8 = 1 << 0;
 const RST: u8 = 1 << 2;
 const PSH: u8 = 1 << 3;
 
+// Add these constants at the top of tcp.rs
+const INITIAL_RTO: Duration = Duration::from_millis(1000); // 1 second initial RTO
+const MIN_RTO: Duration = Duration::from_millis(200); // 200ms minimum RTO
+const MAX_RTO: Duration = Duration::from_secs(60); // 60 seconds maximum RTO
+const MAX_RETRANSMISSIONS: u8 = 5; // Maximum retransmission attempts
+const ALPHA: f64 = 0.125; // Smoothing factor for SRTT (RFC 6298 recommends 1/8)
+const BETA: f64 = 0.25; // Smoothing factor for RTTVAR (RFC 6298 recommends 1/4)
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpKey {
     src_ip: Ipv4Addr,
@@ -106,6 +114,16 @@ impl std::fmt::Display for TcpEvent {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RetransmitSegment {
+    pub data: Vec<u8>,        // Payload data
+    pub seq: u32,             // Starting sequence number
+    pub sent_at: Instant,     // When this segment was last sent
+    pub retransmit_count: u8, // Number of times this segment has been retransmitted
+    pub flags: u8,            // TCP flags (SYN, ACK, FIN, etc.)
+    pub ack: u32,             // ACK number (if ACK flag is set)
+}
+
 #[derive(Debug)]
 pub struct TcpConnection {
     id: u64,
@@ -121,6 +139,12 @@ pub struct TcpConnection {
     established_at: Option<Instant>,
     bytes_received: usize,
     pub bytes_sent: usize,
+    // retransmission
+    rto: Duration,          // Current RTO value
+    srtt: Option<Duration>, // Smoothed RTT
+    rttvar: Duration,       // RTT variance
+    // New retransmission queue - key is starting sequence number
+    pub retransmit_queue: BTreeMap<u32, RetransmitSegment>,
 }
 
 impl TcpConnection {
@@ -139,6 +163,11 @@ impl TcpConnection {
             established_at: None,
             bytes_received: 0,
             bytes_sent: 0,
+            // Retransmission fields
+            rto: INITIAL_RTO,
+            srtt: None,
+            rttvar: Duration::from_millis(500), // Initial variance
+            retransmit_queue: BTreeMap::new(),
         }
     }
 
@@ -285,6 +314,183 @@ impl TcpConnection {
     }
 }
 
+impl TcpConnection {
+    // Calculate new RTO when an RTT measurement is made
+    pub fn update_rto(&mut self, measured_rtt: Duration) {
+        println!(
+            "[#{}] 📊 RTT measurement: {:?}, current RTO: {:?}",
+            self.id, measured_rtt, self.rto
+        );
+        match self.srtt {
+            // First RTT measurement - initialize SRTT and RTTVAR (RFC 6298)
+            None => {
+                self.srtt = Some(measured_rtt);
+                self.rttvar = Duration::from_micros((measured_rtt.as_micros() / 2) as u64);
+                self.rto = Duration::from_micros(
+                    (self.srtt.unwrap().as_micros() + 4 * self.rttvar.as_micros()) as u64,
+                );
+            }
+            // Update RTTVAR and SRTT (RFC 6298)
+            Some(srtt) => {
+                // Convert to signed integers for calculations to avoid underflow
+                let measured_micros = measured_rtt.as_micros() as i128;
+                let srtt_micros = srtt.as_micros() as i128;
+                let rttvar_micros = self.rttvar.as_micros() as i128;
+
+                // Calculate absolute difference |SRTT - measured_RTT|
+                let abs_diff = if srtt_micros > measured_micros {
+                    srtt_micros - measured_micros
+                } else {
+                    measured_micros - srtt_micros
+                };
+                // RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - measured_RTT|
+                let new_rttvar_micros =
+                    ((1.0 - BETA) * rttvar_micros as f64 + BETA * abs_diff as f64) as i128;
+                // SRTT = (1 - alpha) * SRTT + alpha * measured_RTT
+                let new_srtt_micros =
+                    ((1.0 - ALPHA) * srtt_micros as f64 + ALPHA * measured_micros as f64) as i128;
+                // Update the values
+                self.rttvar = Duration::from_micros(new_rttvar_micros as u64);
+                self.srtt = Some(Duration::from_micros(new_srtt_micros as u64));
+                // RTO = SRTT + 4 * RTTVAR
+                let new_rto =
+                    Duration::from_micros((new_srtt_micros + 4 * new_rttvar_micros) as u64);
+                // Enforce RTO bounds
+                self.rto = new_rto.clamp(MIN_RTO, MAX_RTO);
+            }
+        }
+        println!(
+            "[#{}] 📊 Updated → SRTT: {:?}, RTTVAR: {:?}, new RTO: {:?}",
+            self.id,
+            self.srtt.unwrap(),
+            self.rttvar,
+            self.rto
+        );
+    }
+
+    // Add a segment to the retransmission queue
+    pub fn queue_for_retransmit(&mut self, seq: u32, flags: u8, ack: u32, data: Vec<u8>) {
+        let segment = RetransmitSegment {
+            data,
+            seq,
+            sent_at: Instant::now(),
+            retransmit_count: 0,
+            flags,
+            ack,
+        };
+        println!(
+            "[#{}] 📦 Queueing for potential retransmit: seq={}, len={}, flags={:02b}",
+            self.id,
+            seq,
+            segment.data.len(),
+            flags
+        );
+        self.retransmit_queue.insert(seq, segment);
+    }
+
+    // Check for segments that need retransmission
+    pub fn check_retransmit_queue(&mut self) -> Vec<RetransmitSegment> {
+        let now = Instant::now();
+        let mut to_retransmit = Vec::new();
+
+        // Collect segments that have timed out
+        for (&seq, segment) in self.retransmit_queue.iter_mut() {
+            if now.duration_since(segment.sent_at) > self.rto {
+                if segment.retransmit_count < MAX_RETRANSMISSIONS {
+                    println!(
+                        "[#{}] ⏱️ RTO expired for segment: seq={}, len={}, attempt={}",
+                        self.id,
+                        seq,
+                        segment.data.len(),
+                        segment.retransmit_count + 1
+                    );
+
+                    // Clone segment for retransmission
+                    let mut retransmit = segment.clone();
+                    retransmit.retransmit_count += 1;
+                    to_retransmit.push(retransmit);
+
+                    // Back off RTO using exponential backoff
+                    if segment.retransmit_count == 0 {
+                        // Only double RTO on first retransmission (RFC 6298)
+                        self.rto = (self.rto * 2).clamp(MIN_RTO, MAX_RTO);
+                        println!("[#{}] ⏱️ Backing off RTO to {:?}", self.id, self.rto);
+                    }
+                } else {
+                    // Too many retransmissions, will remove from queue
+                    println!(
+                        "[#{}] ❌ Abandoned retransmission after {} attempts: seq={}",
+                        self.id, MAX_RETRANSMISSIONS, seq
+                    );
+                }
+            }
+        }
+
+        // Update segments with new retransmit info
+        for segment in &to_retransmit {
+            if let Some(entry) = self.retransmit_queue.get_mut(&segment.seq) {
+                entry.sent_at = Instant::now();
+                entry.retransmit_count = segment.retransmit_count;
+            }
+        }
+
+        // Remove segments that exceeded max retransmissions
+        self.retransmit_queue
+            .retain(|_, segment| segment.retransmit_count < MAX_RETRANSMISSIONS);
+        to_retransmit
+    }
+
+    // process_ack is called when we receive an ACK, remove acknowledged segments from retransmit queue
+    pub fn process_ack(&mut self, ack_num: u32) {
+        let mut segments_to_remove = Vec::new();
+        let mut rtt_measurements = Vec::new();
+
+        // Find all segments that are fully acknowledged
+        for (&seq, segment) in &self.retransmit_queue {
+            let end_seq = seq.wrapping_add(segment.data.len() as u32);
+
+            // Check if this segment is fully acknowledged
+            if is_seq_lte(seq, ack_num) && is_seq_lt(end_seq, ack_num) {
+                segments_to_remove.push(seq);
+
+                // If this isn't a retransmission, record RTT measurement
+                if segment.retransmit_count == 0 {
+                    let rtt = segment.sent_at.elapsed();
+                    rtt_measurements.push(rtt);
+                }
+            }
+        }
+
+        // Process RTT measurements (if any)
+        for rtt in rtt_measurements {
+            self.update_rto(rtt);
+        }
+
+        // Remove acknowledged segments
+        for seq in segments_to_remove {
+            let removed = self.retransmit_queue.remove(&seq);
+            if let Some(segment) = removed {
+                println!(
+                    "[#{}] ✅ Removed acknowledged segment from retransmit queue: seq={}, len={}",
+                    self.id,
+                    seq,
+                    segment.data.len()
+                );
+            }
+        }
+    }
+}
+
+// Helper function for sequence number comparison (handles wrapping)
+fn is_seq_lt(a: u32, b: u32) -> bool {
+    // RFC 1323: a < b if b - a > 0, evaluated in 32-bit signed arithmetic
+    ((b as i32) - (a as i32)) > 0
+}
+// Helper function for sequence number comparison (handles wrapping)
+fn is_seq_lte(a: u32, b: u32) -> bool {
+    a == b || is_seq_lt(a, b)
+}
+
 pub struct Server {
     device: Box<dyn Device>,
     connections: HashMap<TcpKey, TcpConnection>,
@@ -302,7 +508,12 @@ impl Server {
 
     pub fn run(&mut self) {
         let mut buf = [0u8; 1504];
+        let mut last_retransmit_check = Instant::now();
         loop {
+            if last_retransmit_check.elapsed() > Duration::from_millis(100) {
+                self.check_retransmissions();
+                last_retransmit_check = Instant::now();
+            }
             let n = match self.device.recv(&mut buf) {
                 Ok(n) => n,
                 Err(_) => continue,
@@ -373,6 +584,14 @@ impl Server {
             let mut pkt = Vec::with_capacity(builder.size(0));
             builder.write(&mut pkt, &[]).unwrap();
             self.device.send(&pkt).unwrap();
+
+            // add to rentrasmition queue until we receive final ACK(handshake complete)
+            conn.queue_for_retransmit(
+                conn.server_isn,
+                SYN | ACK,  // SYN-ACK flags
+                ackn,       // acknowledgment number
+                Vec::new(), // empty data for SYN
+            );
             self.connections.insert(key, conn);
             return;
         }
@@ -389,6 +608,10 @@ impl Server {
                 tcp.acknowledgment_number(),
                 payload,
             );
+
+            if (flags & ACK) != 0 {
+                conn.process_ack(tcp.acknowledgment_number());
+            }
 
             // pure ACK for new data
             if conn.state == TcpState::Established
@@ -410,6 +633,7 @@ impl Server {
                 let mut pkt = Vec::with_capacity(builder.size(0));
                 builder.write(&mut pkt, &[]).unwrap();
                 self.device.send(&pkt).unwrap();
+                // it's not necessary to retransmit pure acks
             }
 
             // Prepare echo data on newline
@@ -450,6 +674,13 @@ impl Server {
                 builder.write(&mut pkt, &chunk).unwrap();
                 self.device.send(&pkt).unwrap();
 
+                conn.queue_for_retransmit(
+                    conn.send_next,
+                    PSH | ACK,      // PSH-ACK flags
+                    conn.recv_next, // acknowledgment number
+                    chunk.clone(),  // clone the data for potential retransmission
+                );
+
                 // conn.send_next = conn.send_next.wrapping_add(chunk.len() as u32);
                 if let Ok(text) = std::str::from_utf8(&chunk) {
                     if !text.chars().all(char::is_whitespace) {
@@ -480,6 +711,13 @@ impl Server {
                 let mut ack = Vec::with_capacity(builder.size(0));
                 builder.write(&mut ack, &[]).unwrap();
                 self.device.send(&ack).unwrap();
+                // we need to make sure the client receives our ACK for their FIN
+                conn.queue_for_retransmit(
+                    conn.send_next,
+                    ACK,            // ACK flag
+                    conn.recv_next, // acknowledgment number
+                    Vec::new(),     // empty data
+                );
                 println!("  ← Sent ACK for FIN (recv_next={})", conn.recv_next);
             }
 
@@ -502,6 +740,12 @@ impl Server {
                 let mut fin_pkt = Vec::with_capacity(builder.size(0));
                 builder.write(&mut fin_pkt, &[]).unwrap();
                 self.device.send(&fin_pkt).unwrap();
+                conn.queue_for_retransmit(
+                    conn.send_next,
+                    FIN | ACK,      // FIN-ACK flags
+                    conn.recv_next, // acknowledgment number
+                    Vec::new(),     // empty data for FIN
+                );
                 conn.send_next = conn.send_next.wrapping_add(1);
                 conn.state = TcpState::LastAck;
             }
@@ -531,12 +775,80 @@ impl Server {
                 self.connections.remove(&key);
             }
         }
-        // Handle RST flag
+        // Handle RST flag: they said to shove it wherever
         if flags & RST != 0 {
             if let Some(conn) = self.connections.get(&key) {
                 println!("\n⚠️  RST received for connection #{}", conn.id);
             }
             self.connections.remove(&key);
         }
+    }
+
+    fn check_retransmissions(&mut self) {
+        let mut retransmissions = Vec::new();
+
+        // Collect all retransmissions needed across connections
+        for (key, conn) in &mut self.connections {
+            let segments = conn.check_retransmit_queue();
+            for segment in segments {
+                retransmissions.push((key.clone(), conn.id, segment));
+            }
+        }
+
+        // Process retransmissions
+        for (key, conn_id, segment) in retransmissions {
+            let rkey = key.reverse();
+
+            println!(
+                "[#{}] 🔄 Retransmitting: {} flags={:02b} seq={} ack={} len={}",
+                conn_id,
+                rkey,
+                segment.flags,
+                segment.seq,
+                segment.ack,
+                segment.data.len()
+            );
+
+            // Build packet with appropriate flags using match expressions
+            let mut builder = PacketBuilder::ipv4(rkey.src_ip.octets(), rkey.dst_ip.octets(), 64)
+                .tcp(rkey.src_port, rkey.dst_port, segment.seq, 65535);
+
+            // Apply TCP flags - using match for better readability
+            builder = match segment.flags & SYN != 0 {
+                true => builder.syn(),
+                false => builder,
+            };
+
+            builder = match segment.flags & ACK != 0 {
+                true => builder.ack(segment.ack),
+                false => builder,
+            };
+
+            builder = match segment.flags & FIN != 0 {
+                true => builder.fin(),
+                false => builder,
+            };
+
+            builder = match segment.flags & PSH != 0 {
+                true => builder.psh(),
+                false => builder,
+            };
+
+            // Write packet and send
+            let mut pkt = Vec::with_capacity(builder.size(segment.data.len()));
+            builder.write(&mut pkt, &segment.data).unwrap();
+            self.device.send(&pkt).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Server {
+    pub fn get_connections(&self) -> &HashMap<TcpKey, TcpConnection> {
+        &self.connections
+    }
+
+    pub fn get_connections_mut(&mut self) -> &mut HashMap<TcpKey, TcpConnection> {
+        &mut self.connections
     }
 }
