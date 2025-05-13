@@ -1,0 +1,52 @@
+use std::time::Instant;
+
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Duration;
+
+/// A clock you can inject so production code uses real time
+/// and tests can fast-forward.
+pub trait Clock: Send + Sync + 'static {
+    fn now(&self) -> Instant;
+}
+
+/// Production clock: just wraps `Instant::now()`.
+#[derive(Clone)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+/// A test clock you can manually advance.
+pub struct MockClock {
+    inner: Arc<Mutex<Instant>>,
+}
+
+#[cfg(test)]
+impl MockClock {
+    /// Start the mock at the given instant.
+    pub fn new(start: Instant) -> Self {
+        MockClock {
+            inner: Arc::new(Mutex::new(start)),
+        }
+    }
+
+    /// Advance the clock by `d`.
+    pub fn advance(&self, d: Duration) {
+        let mut t = self.inner.lock().unwrap();
+        *t += d;
+    }
+}
+
+#[cfg(test)]
+impl Clock for MockClock {
+    fn now(&self) -> Instant {
+        *self.inner.lock().unwrap()
+    }
+}

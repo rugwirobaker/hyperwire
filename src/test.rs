@@ -1,16 +1,46 @@
-// src/test.rs
-
 use super::*;
+use crate::tcp::TcpKey;
 use etherparse::{IpNumber, Ipv4HeaderSlice, PacketBuilder, TcpHeaderSlice};
 use std::collections::VecDeque;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+/// A test clock you can manually advance.
+pub struct MockClock {
+    inner: Arc<Mutex<Instant>>,
+}
+
+#[cfg(test)]
+impl MockClock {
+    /// Start the mock at the given instant.
+    pub fn new(start: Instant) -> Self {
+        MockClock {
+            inner: Arc::new(Mutex::new(start)),
+        }
+    }
+
+    /// Advance the clock by `d`.
+    pub fn advance(&self, d: Duration) {
+        let mut t = self.inner.lock().unwrap();
+        *t += d;
+    }
+}
+
+impl Clock for MockClock {
+    fn now(&self) -> Instant {
+        *self.inner.lock().unwrap()
+    }
+}
 
 #[derive(Clone)]
 struct MockDevice {
     rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     tx_log: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    // mock_time: Arc<Mutex<Option<Instant>>>,
+    drop_probability: Arc<Mutex<f32>>,
 }
 
 impl MockDevice {
@@ -18,6 +48,8 @@ impl MockDevice {
         Self {
             rx_queue: Arc::new(Mutex::new(VecDeque::new())),
             tx_log: Arc::new(Mutex::new(Vec::new())),
+            // mock_time: Arc::new(Mutex::new(None)), // No time control by default
+            drop_probability: Arc::new(Mutex::new(0.0)), // No packet loss by default
         }
     }
 
@@ -41,21 +73,72 @@ impl MockDevice {
     fn last_sent_packet(&self) -> Option<Vec<u8>> {
         self.tx_log.lock().unwrap().last().map(|(_, p)| p.clone())
     }
+
+    // fn enable_time_control(&self) -> bool {
+    //     let mut time = self.mock_time.lock().unwrap();
+    //     match *time {
+    //         None => {
+    //             *time = Some(Instant::now());
+    //             println!("⏱️ Time control enabled");
+    //             true
+    //         }
+    //         Some(_) => {
+    //             println!("⏱️ Time control already enabled");
+    //             false
+    //         }
+    //     }
+    // }
+
+    // fn advance_time(&self, duration: Duration) -> bool {
+    //     let mut time = self.mock_time.lock().unwrap();
+    //     match *time {
+    //         Some(current) => {
+    //             *time = Some(current + duration);
+    //             println!("⏱️ Advanced mock time by {:?}", duration);
+    //             true
+    //         }
+    //         None => {
+    //             println!("⚠️ Cannot advance time: time control not enabled");
+    //             false
+    //         }
+    //     }
+    // }
+
+    /// Set packet loss probability (0.0 = no loss, 1.0 = drop all)
+    fn set_drop_probability(&self, probability: f32) {
+        let prob = probability.max(0.0).min(1.0);
+        *self.drop_probability.lock().unwrap() = prob;
+        println!("📉 Packet loss probability set to {:.1}%", prob * 100.0);
+    }
+
+    // /// Get current drop probability
+    // fn get_drop_probability(&self) -> f32 {
+    //     *self.drop_probability.lock().unwrap()
+    // }
 }
 
 impl Device for MockDevice {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut queue = self.rx_queue.lock().unwrap();
-        if let Some(packet) = queue.pop_front() {
-            let len = packet.len().min(buf.len());
-            buf[..len].copy_from_slice(&packet[..len]);
-            Ok(len)
-        } else {
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        match queue.pop_front() {
+            Some(packet) => {
+                let len = packet.len().min(buf.len());
+                buf[..len].copy_from_slice(&packet[..len]);
+                Ok(len)
+            }
+            None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         }
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        // Check if we should drop this packet
+        let drop_probability = *self.drop_probability.lock().unwrap();
+        if drop_probability > 0.0 && rand::random::<f32>() < drop_probability {
+            println!("🔥 DROPPING outgoing packet (simulation)");
+            // Return success but don't log - simulates packet loss
+            return Ok(buf.len());
+        }
+
         let packet = buf.to_vec();
         let len = packet.len(); // Save length before move
 
@@ -171,18 +254,20 @@ fn parse_tcp_packet(packet: &[u8]) -> (Ipv4HeaderSlice, TcpHeaderSlice) {
 // Now the actual tests
 #[test]
 fn test_tcp_handshake() {
-    let mock = MockDevice::new();
-    let mut server = Server::new(Box::new(mock.clone()));
+    let dev = MockDevice::new();
+    let start = Instant::now();
+    let clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(dev.clone()), clock.clone());
 
     // Client sends SYN
     let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, 1000);
-    mock.inject_packet("Client SYN", syn.clone());
+    dev.inject_packet("Client SYN", syn.clone());
 
     // Process the SYN
     server.handle_packet(&syn);
 
     // Verify SYN-ACK was sent
-    let sent = mock.get_sent_packets();
+    let sent = dev.get_sent_packets();
     assert_eq!(sent.len(), 1, "Expected 1 packet (SYN-ACK)");
 
     let syn_ack = &sent[0].1;
@@ -193,22 +278,24 @@ fn test_tcp_handshake() {
 
 #[test]
 fn test_echo_single_line() {
-    let mock = MockDevice::new();
-    let mut server = Server::new(Box::new(mock.clone()));
+    let dev = MockDevice::new();
+    let start = Instant::now();
+    let clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(dev.clone()), clock.clone());
 
     // Establish connection first
-    establish_connection(&mock, &mut server);
+    establish_connection(&dev, &mut server);
 
     // Send data: "hello\n"
     let data = PacketFactory::data(
         "10.0.0.2", "10.0.0.1", 12345, 80, 1001, 1, // seq, ack
         b"hello\n",
     );
-    mock.inject_packet("Data: hello", data.clone());
+    dev.inject_packet("Data: hello", data.clone());
     server.handle_packet(&data);
 
     // Check that echo was sent back
-    let sent = mock.get_sent_packets();
+    let sent = dev.get_sent_packets();
 
     // After establish_connection clears, we should have:
     // 1. ACK for the data
@@ -231,29 +318,33 @@ fn test_echo_single_line() {
 }
 
 // Helper function to establish a connection
-fn establish_connection(mock: &MockDevice, server: &mut Server) {
+fn establish_connection(mock: &MockDevice, server: &mut Server) -> (TcpKey, u32) {
     // SYN
     let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, 1000);
     server.handle_packet(&syn);
 
     // Get SYN-ACK details
     let syn_ack = mock.last_sent_packet().unwrap();
-    let (_, tcp) = parse_tcp_packet(&syn_ack);
-    let server_seq = tcp.sequence_number();
+    let (ip_hdr, tcp_hdr) = parse_tcp_packet(&syn_ack);
+    let key = TcpKey::new(&ip_hdr, &tcp_hdr);
+    let server_seq = tcp_hdr.sequence_number();
 
     // ACK
     let ack = PacketFactory::ack("10.0.0.2", "10.0.0.1", 12345, 80, 1001, server_seq + 1);
     server.handle_packet(&ack);
-
     mock.clear_sent(); // Clear handshake packets for cleaner test output
+
+    (key, server_seq)
 }
 
 #[test]
 fn test_out_of_order_reassembly() {
-    let mock = MockDevice::new();
-    let mut server = Server::new(Box::new(mock.clone()));
+    let dev = MockDevice::new();
+    let start = Instant::now();
+    let clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(dev.clone()), clock.clone());
 
-    establish_connection(&mock, &mut server);
+    establish_connection(&dev, &mut server);
 
     // Send "world\n" first (out of order)
     let pkt2 = PacketFactory::data(
@@ -270,7 +361,7 @@ fn test_out_of_order_reassembly() {
     server.handle_packet(&pkt1);
 
     // Verify the complete echo
-    let sent = mock.get_sent_packets();
+    let sent = dev.get_sent_packets();
     let echo = sent.last().unwrap();
 
     let payload_offset = Ipv4HeaderSlice::from_slice(&echo.1).unwrap().slice().len()
@@ -284,10 +375,12 @@ fn test_out_of_order_reassembly() {
 
 #[test]
 fn test_connection_teardown() {
-    let mock = MockDevice::new();
-    let mut server = Server::new(Box::new(mock.clone()));
+    let dev = MockDevice::new();
+    let start = Instant::now();
+    let clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(dev.clone()), clock.clone());
 
-    establish_connection(&mock, &mut server);
+    establish_connection(&dev, &mut server);
 
     // Send data and get echo
     let data = PacketFactory::data("10.0.0.2", "10.0.0.1", 12345, 80, 1001, 1, b"test\n");
@@ -300,10 +393,216 @@ fn test_connection_teardown() {
     server.handle_packet(&fin);
 
     // Server should ACK the FIN and send its own FIN
-    let sent = mock.get_sent_packets();
+    let sent = dev.get_sent_packets();
     let last_packets = sent.iter().rev().take(2).collect::<Vec<_>>();
 
     // Verify server sent FIN+ACK
     let has_fin_ack = last_packets.iter().any(|(desc, _)| desc.contains("-AF-"));
     assert!(has_fin_ack, "Expected server to send FIN+ACK");
+}
+
+#[test]
+fn test_retransmission() {
+    // 1) Set up mock device + clock + server
+    let mock_dev = MockDevice::new();
+    let start = Instant::now();
+    let mock_clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(mock_dev.clone()), mock_clock.clone());
+
+    // 2) Handshake & grab the key and the server initial sequence number
+    let (key, server_isn) = establish_connection(&mock_dev, &mut server);
+
+    // 3) Force a small RTO for quick test
+    let test_rto = Duration::from_millis(200);
+    server.force_rto_for(&key, test_rto);
+
+    // 4) Tell the mock to DROP outgoing packets initially
+    mock_dev.set_drop_probability(1.0);
+
+    // 5) Inject a data packet from the client
+    //    We pick client seq = 1001, ack = 1, payload = b"ping\n"
+    let payload = b"ping\n";
+    let client_seq = 1001;
+    let client_ack = 1;
+    let data_pkt = PacketFactory::data(
+        "10.0.0.2", "10.0.0.1", 12345, 80, client_seq, client_ack, payload,
+    );
+    mock_dev.inject_packet("Client→Server data", data_pkt.clone());
+    server.handle_packet(&data_pkt);
+
+    // 6) The server tried to send its PSH+ACK echo, but it was dropped.
+    //    Clear any logged sends just in case.
+    // mock_dev.clear_sent();
+
+    // 7) Advance time just past the RTO
+    mock_clock.advance(test_rto + Duration::from_millis(1));
+
+    // 8) Turn DROPPING off so we can *see* the retransmission
+    mock_dev.set_drop_probability(0.0);
+
+    // 9) Trigger retransmission sweep
+    server.check_retransmissions();
+
+    // 10) We should now have at least one packet in the log:
+    let sent = mock_dev.get_sent_packets();
+    assert!(
+        !sent.is_empty(),
+        "Expected at least one retransmitted packet"
+    );
+
+    // 11) Parse the first retransmitted packet and verify it matches our data
+    let (_desc, pkt) = &sent[0];
+    let (ip_hdr, tcp_hdr) = parse_tcp_packet(&pkt);
+
+    let expected_seq = server_isn.wrapping_add(1);
+    assert_eq!(
+        tcp_hdr.sequence_number(),
+        expected_seq,
+        "Retransmit must use the server's original send sequence"
+    );
+    // 12) And that the payload is intact
+    let payload_offset = ip_hdr.slice().len() + tcp_hdr.slice().len();
+    assert_eq!(
+        &pkt[payload_offset..],
+        payload,
+        "Retransmitted payload must match original"
+    );
+}
+
+#[test]
+fn test_retransmission_backoff_timing() {
+    let mock_dev = MockDevice::new();
+    let start = Instant::now();
+    let clock = Arc::new(MockClock::new(start));
+    let mut server = Server::new(Box::new(mock_dev.clone()), clock.clone());
+
+    // 1. three-way handshake
+    let (key, server_isn) = establish_connection(&mock_dev, &mut server);
+
+    // Apply a *tiny* initial RTO (100 ms) to the **server-to-client** flow
+    let initial_rto = Duration::from_millis(100);
+    server.force_rto_for(&key.reverse(), initial_rto);
+
+    // We want the first PSH+ACK to be dropped
+    mock_dev.set_drop_probability(1.0);
+
+    // 2. client sends a short line
+    let payload = b"foo\n";
+    let data_pkt = PacketFactory::data(
+        "10.0.0.2", "10.0.0.1", 12345, 80, /*seq*/ 1001, /*ack*/ 1, payload,
+    );
+    mock_dev.inject_packet("C→S data", data_pkt.clone());
+    server.handle_packet(&data_pkt);
+
+    // 3. first retransmission (after 100 ms)
+    clock.advance(initial_rto + Duration::from_millis(1)); // → ≈101 ms
+    mock_dev.set_drop_probability(0.0); // observe sends
+    server.check_retransmissions();
+
+    let first = mock_dev.get_sent_packets();
+    assert!(!first.is_empty(), "first retransmit expected");
+    mock_dev.clear_sent(); // clean slate
+
+    // 4. second retransmission should follow *after* doubled RTO
+    let doubled_rto = initial_rto * 2; // 200 ms
+
+    // 4-a  advance to 10 ms *before* the 2 × RTO threshold  (no send expected)
+    clock.advance(doubled_rto - Duration::from_millis(10)); // +190 ms
+    server.check_retransmissions();
+    assert!(
+        mock_dev.get_sent_packets().is_empty(),
+        "should not retransmit before doubled RTO"
+    );
+
+    // 4-b  step *past* the deadline by another 15 ms (send expected)
+    clock.advance(Duration::from_millis(15)); // +15 ms → 205 ms
+    server.check_retransmissions();
+
+    let second = mock_dev.get_sent_packets();
+    assert!(
+        !second.is_empty(),
+        "second retransmit at doubled RTO expected"
+    );
+
+    let (_desc, pkt2) = &second[0];
+    let (_ip, tcp2) = parse_tcp_packet(pkt2);
+
+    let expected_seq = server_isn.wrapping_add(1); // first data seq
+    assert_eq!(
+        tcp2.sequence_number(),
+        expected_seq,
+        "second retransmit uses same server sequence"
+    );
+
+    let off = Ipv4HeaderSlice::from_slice(pkt2).unwrap().slice().len()
+        + TcpHeaderSlice::from_slice(&pkt2[20..])
+            .unwrap()
+            .slice()
+            .len();
+    assert_eq!(&pkt2[off..], payload, "payload intact on second retransmit");
+}
+
+/// After MAX_RETRANSMISSIONS attempts the segment is abandoned.
+#[test]
+fn test_retransmission_abandon_after_max() {
+    use crate::tcp::MAX_RETRANSMISSIONS;
+
+    // ── test rig ────────────────────────────────────────────────────────────
+    let dev = MockDevice::new();
+    let clock = Arc::new(MockClock::new(Instant::now()));
+    let mut srv = Server::new(Box::new(dev.clone()), clock.clone());
+
+    let (cli_key, _isn) = establish_connection(&dev, &mut srv);
+
+    let key = cli_key.reverse();
+
+    // set a small-but-legal RTO (>= MIN_RTO so it is not clamped)
+    let initial_rto = Duration::from_millis(250);
+    assert!(srv.force_rto_for(&key, initial_rto));
+
+    // make the very first transmit disappear
+    dev.set_drop_probability(1.0);
+
+    // C → S data (will generate a server reply that gets dropped)
+    let data = PacketFactory::data(
+        "10.0.0.2", "10.0.0.1", 12345, 80, /*seq*/ 1001, /*ack*/ 1, b"bar\n",
+    );
+    dev.inject_packet("C→S data", data.clone());
+    srv.handle_packet(&data);
+
+    dev.clear_sent(); // ignore the dropped packet
+    dev.set_drop_probability(0.0); // watch retries
+
+    //RTO cycles
+    for attempt in 1..=MAX_RETRANSMISSIONS as usize + 1 {
+        // pull the *current* RTO from the connection
+        let cur_rto = srv.get_connection_for_key(&key).unwrap().get_rto();
+
+        // go just past it
+        clock.advance(cur_rto + Duration::from_millis(1));
+        srv.check_retransmissions();
+
+        let sent = dev.get_sent_packets();
+        if attempt <= MAX_RETRANSMISSIONS as usize {
+            assert!(
+                !sent.is_empty(),
+                "attempt {attempt}: expected retransmission"
+            );
+        } else {
+            assert!(
+                sent.is_empty(),
+                "attempt {attempt}: expected no retransmission (segment abandoned)"
+            );
+        }
+        dev.clear_sent();
+    }
+
+    // queue must be empty now
+    assert!(
+        srv.get_connection_for_key(&key)
+            .unwrap()
+            .get_retransmit_queue()
+            .is_empty(),
+        "retransmit queue should be empty after abandonment"
+    );
 }

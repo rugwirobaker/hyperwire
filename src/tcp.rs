@@ -1,9 +1,12 @@
 use etherparse::{IpNumber, Ipv4HeaderSlice, PacketBuilder, TcpHeaderSlice};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::clock::Clock;
 use crate::Device;
 
 const SYN: u8 = 1 << 1;
@@ -15,9 +18,10 @@ const PSH: u8 = 1 << 3;
 const INITIAL_RTO: Duration = Duration::from_millis(1000); // 1 second initial RTO
 const MIN_RTO: Duration = Duration::from_millis(200); // 200ms minimum RTO
 const MAX_RTO: Duration = Duration::from_secs(60); // 60 seconds maximum RTO
-const MAX_RETRANSMISSIONS: u8 = 5; // Maximum retransmission attempts
 const ALPHA: f64 = 0.125; // Smoothing factor for SRTT (RFC 6298 recommends 1/8)
 const BETA: f64 = 0.25; // Smoothing factor for RTTVAR (RFC 6298 recommends 1/4)
+
+pub const MAX_RETRANSMISSIONS: u8 = 5; // Maximum retransmission attempts
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpKey {
@@ -63,11 +67,8 @@ pub enum TcpState {
     Listen,
     SynReceived,
     Established,
-    // FinWait1,
-    // FinWait2,
     CloseWait,
     LastAck,
-    // TimeWait,
 }
 
 impl std::fmt::Display for TcpState {
@@ -143,7 +144,6 @@ impl RetransmitSegment {
     }
 }
 
-#[derive(Debug)]
 pub struct TcpConnection {
     id: u64,
     state: TcpState,
@@ -164,11 +164,32 @@ pub struct TcpConnection {
     rttvar: Duration,       // RTT variance
     // New retransmission queue - key is starting sequence number
     retransmit_queue: BTreeMap<u32, RetransmitSegment>,
+    // a clock we control
+    clock: Arc<dyn Clock>,
+}
+
+impl fmt::Debug for TcpConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpConnection")
+            .field("id", &self.id)
+            .field("state", &self.state)
+            .field("server_isn", &self.server_isn)
+            .field("recv_next", &self.recv_next)
+            .field("send_next", &self.send_next)
+            .field("recv_buffer.len()", &self.recv_buffer.len())
+            .field("send_buffer.len()", &self.send_buffer.len())
+            .field("reasm_buf.len()", &self.reasm_buf.len())
+            .field("rto", &self.rto)
+            .field("srtt", &self.srtt)
+            .field("rttvar", &self.rttvar)
+            .field("retransmit_queue.len()", &self.retransmit_queue.len())
+            .finish()
+    }
 }
 
 impl TcpConnection {
     /// Create an initial listener-state connection
-    pub fn new_listen(id: u64) -> Self {
+    pub fn new_listen(id: u64, clock: Arc<dyn Clock>) -> Self {
         TcpConnection {
             id,
             state: TcpState::Listen,
@@ -178,7 +199,7 @@ impl TcpConnection {
             recv_buffer: Vec::new(),
             send_buffer: Vec::new(),
             reasm_buf: BTreeMap::new(),
-            created_at: Instant::now(),
+            created_at: clock.now(),
             established_at: None,
             bytes_received: 0,
             bytes_sent: 0,
@@ -187,6 +208,7 @@ impl TcpConnection {
             srtt: None,
             rttvar: Duration::from_millis(500), // Initial variance
             retransmit_queue: BTreeMap::new(),
+            clock,
         }
     }
 
@@ -261,7 +283,7 @@ impl TcpConnection {
 
                 // Mark when connection becomes established
                 if next == TcpState::Established {
-                    self.established_at = Some(Instant::now());
+                    self.established_at = Some(self.clock.now());
                 }
             }
         }
@@ -344,9 +366,10 @@ impl TcpConnection {
             None => {
                 self.srtt = Some(measured_rtt);
                 self.rttvar = Duration::from_micros((measured_rtt.as_micros() / 2) as u64);
-                self.rto = Duration::from_micros(
+                let new_rto = Duration::from_micros(
                     (self.srtt.unwrap().as_micros() + 4 * self.rttvar.as_micros()) as u64,
                 );
+                self.rto = new_rto.clamp(MIN_RTO, MAX_RTO);
             }
             // Update RTTVAR and SRTT (RFC 6298)
             Some(srtt) => {
@@ -386,10 +409,10 @@ impl TcpConnection {
         );
     }
 
-    // Add a segment to the retransmission queue
+    // Qeues packets to the retransmission queue
     pub fn queue_for_retransmit(&mut self, seq: u32, flags: u8, ack: u32, data: Vec<u8>) {
-        let sent_at = Instant::now();
-        let segment = RetransmitSegment::new(seq, flags, sent_at, 0, data, ack);
+        let sent_at = self.clock.now();
+        let segment = RetransmitSegment::new(seq, 0, sent_at, flags, data, ack);
 
         println!(
             "[#{}] 📦 Queueing for potential retransmit: seq={}, len={}, flags={:02b}",
@@ -403,12 +426,12 @@ impl TcpConnection {
 
     // Check for segments that need retransmission
     pub fn check_retransmit_queue(&mut self) -> Vec<RetransmitSegment> {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut to_retransmit = Vec::new();
 
         // Collect segments that have timed out
         for (&seq, segment) in self.retransmit_queue.iter_mut() {
-            if now.duration_since(segment.sent_at) > self.rto {
+            if now.duration_since(segment.sent_at) >= self.rto {
                 if segment.retransmit_count < MAX_RETRANSMISSIONS {
                     println!(
                         "[#{}] ⏱️ RTO expired for segment: seq={}, len={}, attempt={}",
@@ -442,7 +465,7 @@ impl TcpConnection {
         // Update segments with new retransmit info
         for segment in &to_retransmit {
             if let Some(entry) = self.retransmit_queue.get_mut(&segment.seq) {
-                entry.sent_at = Instant::now();
+                entry.sent_at = self.clock.now();
                 entry.retransmit_count = segment.retransmit_count;
             }
         }
@@ -506,14 +529,16 @@ fn is_seq_lte(a: u32, b: u32) -> bool {
 
 pub struct Server {
     device: Box<dyn Device>,
+    clock: Arc<dyn Clock>,
     connections: HashMap<TcpKey, TcpConnection>,
     conn_counter: u64,
 }
 
 impl Server {
-    pub fn new(device: Box<dyn Device>) -> Self {
+    pub fn new(device: Box<dyn Device>, clock: Arc<dyn Clock>) -> Self {
         Self {
             device,
+            clock,
             connections: HashMap::new(),
             conn_counter: 0,
         }
@@ -521,11 +546,11 @@ impl Server {
 
     pub fn run(&mut self) {
         let mut buf = [0u8; 1504];
-        let mut last_retransmit_check = Instant::now();
+        let mut last_retransmit_check = self.clock.now();
         loop {
             if last_retransmit_check.elapsed() > Duration::from_millis(100) {
                 self.check_retransmissions();
-                last_retransmit_check = Instant::now();
+                last_retransmit_check = self.clock.now();
             }
             let n = match self.device.recv(&mut buf) {
                 Ok(n) => n,
@@ -569,7 +594,7 @@ impl Server {
             println!("\n🎯 New connection #{} from {}", self.conn_counter, key);
             println!("   Client ISN: {}, Server ISN: {}", client_isn, server_isn);
 
-            let mut conn = TcpConnection::new_listen(self.conn_counter);
+            let mut conn = TcpConnection::new_listen(self.conn_counter, self.clock.clone());
             // trigger Listen->SynReceived
             if let Some(ns) = conn.state.on_event(TcpEvent::RecvSyn) {
                 conn.state = ns;
@@ -797,7 +822,7 @@ impl Server {
         }
     }
 
-    fn check_retransmissions(&mut self) {
+    pub fn check_retransmissions(&mut self) {
         let mut retransmissions = Vec::new();
 
         // Collect all retransmissions needed across connections
@@ -863,5 +888,55 @@ impl Server {
 
     pub fn get_connections_mut(&mut self) -> &mut HashMap<TcpKey, TcpConnection> {
         &mut self.connections
+    }
+}
+
+#[cfg(test)]
+impl TcpConnection {
+    pub fn set_rto(&mut self, rto: Duration) {
+        self.rto = rto;
+    }
+
+    pub fn get_rto(&self) -> Duration {
+        self.rto
+    }
+
+    // For verification in tests
+    pub fn get_retransmit_queue(&self) -> &BTreeMap<u32, RetransmitSegment> {
+        &self.retransmit_queue
+    }
+}
+
+#[cfg(test)]
+impl Server {
+    pub fn force_rto_for(&mut self, key: &TcpKey, rto: Duration) -> bool {
+        match self.connections.get_mut(key) {
+            Some(conn) => {
+                conn.rto = rto;
+                println!("✅ Forced RTO to {:?} for connection #{}", rto, conn.id);
+                true
+            }
+            None => {
+                println!("❌ No connection found for key: {}", key);
+                false
+            }
+        }
+    }
+
+    pub fn get_connection_for_key(&self, key: &TcpKey) -> Option<&TcpConnection> {
+        self.connections.get(key)
+    }
+}
+
+#[cfg(test)]
+impl TcpKey {
+    // Test-specific constructor that doesn't require header slices
+    pub fn new_for_test(src_ip: &str, src_port: u16, dst_ip: &str, dst_port: u16) -> Self {
+        TcpKey {
+            src_ip: src_ip.parse().unwrap(),
+            src_port,
+            dst_ip: dst_ip.parse().unwrap(),
+            dst_port,
+        }
     }
 }
