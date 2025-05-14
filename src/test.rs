@@ -606,3 +606,73 @@ fn test_retransmission_abandon_after_max() {
         "retransmit queue should be empty after abandonment"
     );
 }
+
+#[test]
+fn lost_syn_ack_then_success() {
+    use crate::tcp::{TcpState, MAX_RETRANSMISSIONS};
+
+    let dev = MockDevice::new();
+    let clock = Arc::new(MockClock::new(Instant::now()));
+    let mut server = Server::new(Box::new(dev.clone()), clock.clone());
+
+    // ── 1) C → S : SYN ──────────────────────────────────────────────
+    let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, /*seq*/ 1000);
+    server.handle_packet(&syn);
+
+    let cli_srv_key = TcpKey::new_for_test("10.0.0.2", 12345, "10.0.0.1", 80);
+
+    // make the SYN-ACK RTO tiny so the test runs fast
+    let tiny_rto = Duration::from_millis(20);
+    assert!(server.force_rto_for(&cli_srv_key, tiny_rto));
+
+    // ── 2) drop the first N-1 retransmissions ──────────────────────────
+    dev.set_drop_probability(1.0);
+
+    // helper: gets the live RTO each time
+    let mut current_rto = tiny_rto;
+    for _ in 0..(MAX_RETRANSMISSIONS - 1) {
+        clock.advance(current_rto + Duration::from_millis(1));
+        server.check_retransmissions();
+        dev.clear_sent();
+
+        // after the first timeout the stack may have backed-off
+        current_rto = server
+            .get_connection_for_key(&cli_srv_key) // ← use the original key
+            .unwrap()
+            .get_rto();
+    }
+
+    // ── 3) allow the next SYN-ACK to pass ──────────────────────────────
+    dev.set_drop_probability(0.0);
+    clock.advance(current_rto + Duration::from_millis(1)); // ← use live RTO
+    server.check_retransmissions();
+
+    // we should now have exactly one packet: a SYN-ACK
+    let syn_ack = dev.last_sent_packet().expect("SYN-ACK must appear");
+    let (_ip, tcp_sa) = parse_tcp_packet(&syn_ack);
+    assert!(
+        tcp_sa.syn() && tcp_sa.ack(),
+        "server packet should be SYN+ACK"
+    );
+
+    // ── 4) C → S : final ACK finishes the handshake ─────────────────
+    let final_ack = PacketFactory::ack(
+        "10.0.0.2",
+        "10.0.0.1",
+        12345,
+        80,
+        /*seq*/ 1001,
+        tcp_sa.sequence_number() + 1, // ACK the SYN-ACK
+    );
+    server.handle_packet(&final_ack);
+
+    let conn = server
+        .get_connection_for_key(&cli_srv_key)
+        .expect("connection should exist");
+
+    assert_eq!(conn.state(), TcpState::Established, "handshake completed");
+    assert!(
+        conn.get_retransmit_queue().is_empty(),
+        "retransmit queue must be empty after ACK arrives"
+    );
+}

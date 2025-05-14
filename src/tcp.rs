@@ -960,6 +960,11 @@ impl TcpConnection {
     pub fn get_retransmit_queue(&self) -> &BTreeMap<u32, RetransmitSegment> {
         &self.retransmit_queue
     }
+
+    /// Inspect the FSM state from the test-suite.
+    pub fn state(&self) -> TcpState {
+        self.state
+    }
 }
 
 #[cfg(test)]
