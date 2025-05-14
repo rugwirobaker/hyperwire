@@ -66,10 +66,6 @@ impl MockDevice {
         self.tx_log.lock().unwrap().clear();
     }
 
-    // fn drain_one_packet(&self) -> Option<Vec<u8>> {
-    //     self.rx_queue.lock().unwrap().pop_front()
-    // }
-
     fn last_sent_packet(&self) -> Option<Vec<u8>> {
         self.tx_log.lock().unwrap().last().map(|(_, p)| p.clone())
     }

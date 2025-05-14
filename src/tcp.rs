@@ -9,12 +9,6 @@ use std::time::{Duration, Instant};
 use crate::clock::Clock;
 use crate::Device;
 
-const SYN: u8 = 1 << 1;
-const ACK: u8 = 1 << 4;
-const FIN: u8 = 1 << 0;
-const RST: u8 = 1 << 2;
-const PSH: u8 = 1 << 3;
-
 const INITIAL_RTO: Duration = Duration::from_millis(1000); // 1 second initial RTO
 const MIN_RTO: Duration = Duration::from_millis(200); // 200ms minimum RTO
 const MAX_RTO: Duration = Duration::from_secs(60); // 60 seconds maximum RTO
@@ -22,6 +16,43 @@ const ALPHA: f64 = 0.125; // Smoothing factor for SRTT (RFC 6298 recommends 1/8)
 const BETA: f64 = 0.25; // Smoothing factor for RTTVAR (RFC 6298 recommends 1/4)
 
 pub const MAX_RETRANSMISSIONS: u8 = 5; // Maximum retransmission attempts
+
+///! TCP protocol flags as defined in RFC 793.
+///
+/// SYN flag - synchronize sequence numbers
+pub const SYN: u8 = 1 << 1;
+/// ACK flag - acknowledgment field is significant
+pub const ACK: u8 = 1 << 4;
+/// FIN flag - no more data from sender
+pub const FIN: u8 = 1 << 0;
+/// RST flag - reset the connection
+pub const RST: u8 = 1 << 2;
+/// PSH flag - push function
+pub const PSH: u8 = 1 << 3;
+/// URG flag - urgent pointer field is significant
+pub const URG: u8 = 1 << 5;
+
+/// Combines TCP flags for human-readable display
+pub fn flags_to_string(flags: u8) -> String {
+    format!(
+        "{}{}{}{}{}",
+        if flags & SYN != 0 { "S" } else { "-" },
+        if flags & ACK != 0 { "A" } else { "-" },
+        if flags & FIN != 0 { "F" } else { "-" },
+        if flags & RST != 0 { "R" } else { "-" },
+        if flags & PSH != 0 { "P" } else { "-" },
+    )
+}
+
+/// Combine flags from a TCP header into a flags byte
+pub fn tcp_header_to_flags(tcp_hdr: &TcpHeaderSlice) -> u8 {
+    (tcp_hdr.fin() as u8) << 0
+        | (tcp_hdr.syn() as u8) << 1
+        | (tcp_hdr.rst() as u8) << 2
+        | (tcp_hdr.psh() as u8) << 3
+        | (tcp_hdr.ack() as u8) << 4
+        | (tcp_hdr.urg() as u8) << 5
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpKey {
@@ -214,20 +245,11 @@ impl TcpConnection {
 
     // on_segment is called whenever we receive a new segment
     pub fn on_segment(&mut self, key: &TcpKey, flags: u8, seq: u32, ack: u32, payload: &[u8]) {
-        let flags_str = format!(
-            "{}{}{}{}{}",
-            if flags & SYN != 0 { "S" } else { "-" },
-            if flags & ACK != 0 { "A" } else { "-" },
-            if flags & FIN != 0 { "F" } else { "-" },
-            if flags & RST != 0 { "R" } else { "-" },
-            if flags & PSH != 0 { "P" } else { "-" },
-        );
-
         println!(
             "[#{}] {} RX: flags={} seq={} ack={} len={}",
             self.id,
             key,
-            flags_str,
+            flags_to_string(flags),
             seq,
             ack,
             payload.len()
@@ -616,34 +638,29 @@ impl Server {
     }
 
     pub fn handle_packet(&mut self, packet: &[u8]) {
-        let ip = match Ipv4HeaderSlice::from_slice(&packet) {
+        let ip_hdr = match Ipv4HeaderSlice::from_slice(&packet) {
             Ok(h) if h.protocol() == IpNumber::from(6) => h,
             _ => return,
         };
-        let tcp = match TcpHeaderSlice::from_slice(&packet[ip.slice().len()..]) {
+        let tcp_hdr = match TcpHeaderSlice::from_slice(&packet[ip_hdr.slice().len()..]) {
             Ok(h) => h,
             _ => return,
         };
 
-        let key = TcpKey::new(&ip, &tcp);
+        let key = TcpKey::new(&ip_hdr, &tcp_hdr);
         let rkey = key.reverse();
 
-        let flags: u8 = (tcp.fin() as u8) << 0
-            | (tcp.syn() as u8) << 1
-            | (tcp.rst() as u8) << 2
-            | (tcp.psh() as u8) << 3
-            | (tcp.ack() as u8) << 4
-            | (tcp.urg() as u8) << 5;
+        let flags = tcp_header_to_flags(&tcp_hdr);
 
         // Debug: Show which client/connection we're dealing with
         println!("📡 Packet from {}:{} -> {}:{}, flags=0x{:02x} (SYN={}, ACK={}, FIN={}, RST={}, PSH={})",
                        key.src_ip, key.src_port, key.dst_ip, key.dst_port, flags,
-                       tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst(), tcp.psh());
+                       tcp_hdr.syn(), tcp_hdr.ack(), tcp_hdr.fin(), tcp_hdr.rst(), tcp_hdr.psh());
 
         // 1) New connection SYN
         if !self.connections.contains_key(&key) && flags == SYN {
             self.conn_counter += 1;
-            let client_isn = tcp.sequence_number();
+            let client_isn = tcp_hdr.sequence_number();
             let server_isn = rand::random();
 
             println!("\n🎯 New connection #{} from {}", self.conn_counter, key);
@@ -691,24 +708,24 @@ impl Server {
 
         // 2) Existing connection
         if let Some(conn) = self.connections.get_mut(&key) {
-            let off = ip.slice().len() + tcp.slice().len();
+            let off = ip_hdr.slice().len() + tcp_hdr.slice().len();
             let payload = &packet[off..];
 
             conn.on_segment(
                 &key,
                 flags,
-                tcp.sequence_number(),
-                tcp.acknowledgment_number(),
+                tcp_hdr.sequence_number(),
+                tcp_hdr.acknowledgment_number(),
                 payload,
             );
 
             if (flags & ACK) != 0 {
-                conn.process_ack(tcp.acknowledgment_number());
+                conn.process_ack(tcp_hdr.acknowledgment_number());
             }
 
             // pure ACK for new data
             if conn.state == TcpState::Established
-                && conn.recv_next != tcp.sequence_number().wrapping_add(payload.len() as u32)
+                && conn.recv_next != tcp_hdr.sequence_number().wrapping_add(payload.len() as u32)
             {
                 println!(
                     "[#{}] {} TX: flags=-A-- seq={} ack={}",
@@ -846,7 +863,7 @@ impl Server {
             // Close connection
             if conn.state == TcpState::LastAck
                 && (flags & ACK) != 0
-                && tcp.acknowledgment_number() == conn.send_next
+                && tcp_hdr.acknowledgment_number() == conn.send_next
             {
                 let total_duration = conn.created_at.elapsed();
                 let established_duration = conn
