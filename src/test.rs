@@ -74,47 +74,12 @@ impl MockDevice {
         self.tx_log.lock().unwrap().last().map(|(_, p)| p.clone())
     }
 
-    // fn enable_time_control(&self) -> bool {
-    //     let mut time = self.mock_time.lock().unwrap();
-    //     match *time {
-    //         None => {
-    //             *time = Some(Instant::now());
-    //             println!("⏱️ Time control enabled");
-    //             true
-    //         }
-    //         Some(_) => {
-    //             println!("⏱️ Time control already enabled");
-    //             false
-    //         }
-    //     }
-    // }
-
-    // fn advance_time(&self, duration: Duration) -> bool {
-    //     let mut time = self.mock_time.lock().unwrap();
-    //     match *time {
-    //         Some(current) => {
-    //             *time = Some(current + duration);
-    //             println!("⏱️ Advanced mock time by {:?}", duration);
-    //             true
-    //         }
-    //         None => {
-    //             println!("⚠️ Cannot advance time: time control not enabled");
-    //             false
-    //         }
-    //     }
-    // }
-
     /// Set packet loss probability (0.0 = no loss, 1.0 = drop all)
     fn set_drop_probability(&self, probability: f32) {
         let prob = probability.max(0.0).min(1.0);
         *self.drop_probability.lock().unwrap() = prob;
         println!("📉 Packet loss probability set to {:.1}%", prob * 100.0);
     }
-
-    // /// Get current drop probability
-    // fn get_drop_probability(&self) -> f32 {
-    //     *self.drop_probability.lock().unwrap()
-    // }
 }
 
 impl Device for MockDevice {
@@ -576,8 +541,7 @@ fn test_retransmission_abandon_after_max() {
     //RTO cycles
     for attempt in 1..=MAX_RETRANSMISSIONS as usize + 1 {
         // pull the *current* RTO from the connection
-        let cur_rto = srv.get_connection_for_key(&key).unwrap().get_rto();
-
+        let cur_rto = srv.peek_conn(&key).unwrap().rto;
         // go just past it
         clock.advance(cur_rto + Duration::from_millis(1));
         srv.check_retransmissions();
@@ -598,11 +562,9 @@ fn test_retransmission_abandon_after_max() {
     }
 
     // queue must be empty now
+    let snapshot = srv.peek_conn(&key).expect("expected a connection");
     assert!(
-        srv.get_connection_for_key(&key)
-            .unwrap()
-            .get_retransmit_queue()
-            .is_empty(),
+        snapshot.retransmits == 0,
         "retransmit queue should be empty after abandonment"
     );
 }
@@ -634,12 +596,8 @@ fn lost_syn_ack_then_success() {
         clock.advance(current_rto + Duration::from_millis(1));
         server.check_retransmissions();
         dev.clear_sent();
-
         // after the first timeout the stack may have backed-off
-        current_rto = server
-            .get_connection_for_key(&cli_srv_key) // ← use the original key
-            .unwrap()
-            .get_rto();
+        current_rto = server.peek_conn(&cli_srv_key).unwrap().rto;
     }
 
     // ── 3) allow the next SYN-ACK to pass ──────────────────────────────
@@ -665,14 +623,10 @@ fn lost_syn_ack_then_success() {
         tcp_sa.sequence_number() + 1, // ACK the SYN-ACK
     );
     server.handle_packet(&final_ack);
-
-    let conn = server
-        .get_connection_for_key(&cli_srv_key)
-        .expect("connection should exist");
-
-    assert_eq!(conn.state(), TcpState::Established, "handshake completed");
+    let snapshot = server.peek_conn(&cli_srv_key).expect("expected connection");
+    assert_eq!(snapshot.state, TcpState::Established, "handshake completed");
     assert!(
-        conn.get_retransmit_queue().is_empty(),
+        snapshot.retransmits == 0,
         "retransmit queue must be empty after ACK arrives"
     );
 }

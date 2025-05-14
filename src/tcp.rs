@@ -531,7 +531,7 @@ impl TcpConnection {
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// // Normal case: 100 < 200
 /// assert!(is_seq_lt(100, 200));
 ///
@@ -560,7 +560,7 @@ fn is_seq_lt(a: u32, b: u32) -> bool {
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// // Equal case
 /// assert!(is_seq_lte(100, 100));
 ///
@@ -936,6 +936,13 @@ impl Server {
 }
 
 #[cfg(test)]
+impl TcpConnection {
+    pub fn set_rto(&mut self, rto: Duration) {
+        self.rto = rto;
+    }
+}
+
+#[cfg(test)]
 impl Server {
     pub fn get_connections(&self) -> &HashMap<TcpKey, TcpConnection> {
         &self.connections
@@ -943,27 +950,6 @@ impl Server {
 
     pub fn get_connections_mut(&mut self) -> &mut HashMap<TcpKey, TcpConnection> {
         &mut self.connections
-    }
-}
-
-#[cfg(test)]
-impl TcpConnection {
-    pub fn set_rto(&mut self, rto: Duration) {
-        self.rto = rto;
-    }
-
-    pub fn get_rto(&self) -> Duration {
-        self.rto
-    }
-
-    // For verification in tests
-    pub fn get_retransmit_queue(&self) -> &BTreeMap<u32, RetransmitSegment> {
-        &self.retransmit_queue
-    }
-
-    /// Inspect the FSM state from the test-suite.
-    pub fn state(&self) -> TcpState {
-        self.state
     }
 }
 
@@ -982,10 +968,6 @@ impl Server {
             }
         }
     }
-
-    pub fn get_connection_for_key(&self, key: &TcpKey) -> Option<&TcpConnection> {
-        self.connections.get(key)
-    }
 }
 
 #[cfg(test)]
@@ -998,5 +980,45 @@ impl TcpKey {
             dst_ip: dst_ip.parse().unwrap(),
             dst_port,
         }
+    }
+}
+
+impl TcpConnection {
+    /// Test-only immutable snapshot of the connection’s state.
+    #[cfg(test)]
+    pub fn peek(&self) -> ConnSnapshot {
+        ConnSnapshot {
+            id: self.id,
+            state: self.state,
+            send_next: self.send_next,
+            recv_next: self.recv_next,
+            rto: self.rto,
+            retransmits: self.retransmit_queue.len(),
+            queued_bytes: self.send_buffer.len(),
+            bytes_received: self.bytes_received,
+            bytes_sent: self.bytes_sent,
+        }
+    }
+}
+
+/// Immutable view – every field is **Copy** so tests can pattern-match easily.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnSnapshot {
+    pub id: u64,
+    pub state: TcpState,
+    pub send_next: u32,
+    pub recv_next: u32,
+    pub rto: Duration,
+    pub retransmits: usize,
+    pub queued_bytes: usize,
+    pub bytes_received: usize,
+    pub bytes_sent: usize,
+}
+
+#[cfg(test)]
+impl Server {
+    pub fn peek_conn(&self, key: &TcpKey) -> Option<ConnSnapshot> {
+        self.connections.get(key).map(|c| c.peek())
     }
 }
