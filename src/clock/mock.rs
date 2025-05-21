@@ -1,25 +1,10 @@
-use std::time::Instant;
-
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use crate::Clock;
 #[cfg(test)]
-use std::time::Duration;
-
-/// A clock you can inject so production code uses real time
-/// and tests can fast-forward.
-pub trait Clock: Send + Sync + 'static {
-    fn now(&self) -> Instant;
-}
-
-/// Production clock: just wraps `Instant::now()`.
-#[derive(Clone)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 #[cfg(test)]
 #[derive(Clone)]

@@ -1,215 +1,31 @@
-use super::*;
-use crate::tcp::TcpKey;
-use etherparse::{IpNumber, Ipv4HeaderSlice, PacketBuilder, TcpHeaderSlice};
-use std::collections::VecDeque;
-use std::io;
-use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+// Import packet tools with a clear purpose
+mod packets;
+
+use crate::clock::mock::MockClock;
+use crate::device::mock::MockDevice;
+use crate::tcp::{Key, Server};
+use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+use packets::{parse_tcp_packet, PacketFactory};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-/// A test clock you can manually advance.
-pub struct MockClock {
-    inner: Arc<Mutex<Instant>>,
-}
+fn establish_connection(mock: &MockDevice, server: &mut Server) -> (Key, u32) {
+    // SYN
+    let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, 1000);
+    server.handle_packet(&syn);
 
-#[cfg(test)]
-impl MockClock {
-    /// Start the mock at the given instant.
-    pub fn new(start: Instant) -> Self {
-        MockClock {
-            inner: Arc::new(Mutex::new(start)),
-        }
-    }
+    // Get SYN-ACK details
+    let syn_ack = mock.last_sent_packet().unwrap();
+    let (ip_hdr, tcp_hdr) = parse_tcp_packet(&syn_ack);
+    let key = Key::new(&ip_hdr, &tcp_hdr);
+    let server_seq = tcp_hdr.sequence_number();
 
-    /// Advance the clock by `d`.
-    pub fn advance(&self, d: Duration) {
-        let mut t = self.inner.lock().unwrap();
-        *t += d;
-    }
-}
+    // ACK
+    let ack = PacketFactory::ack("10.0.0.2", "10.0.0.1", 12345, 80, 1001, server_seq + 1);
+    server.handle_packet(&ack);
+    mock.clear_sent(); // Clear handshake packets for cleaner test output
 
-impl Clock for MockClock {
-    fn now(&self) -> Instant {
-        *self.inner.lock().unwrap()
-    }
-}
-
-#[derive(Clone)]
-struct MockDevice {
-    rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    tx_log: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
-    // mock_time: Arc<Mutex<Option<Instant>>>,
-    drop_probability: Arc<Mutex<f32>>,
-}
-
-impl MockDevice {
-    fn new() -> Self {
-        Self {
-            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
-            tx_log: Arc::new(Mutex::new(Vec::new())),
-            // mock_time: Arc::new(Mutex::new(None)), // No time control by default
-            drop_probability: Arc::new(Mutex::new(0.0)), // No packet loss by default
-        }
-    }
-
-    fn inject_packet(&self, desc: &str, packet: Vec<u8>) {
-        println!("🧪 INJECT: {} ({} bytes)", desc, packet.len());
-        self.rx_queue.lock().unwrap().push_back(packet);
-    }
-
-    fn get_sent_packets(&self) -> Vec<(String, Vec<u8>)> {
-        self.tx_log.lock().unwrap().clone()
-    }
-
-    fn clear_sent(&self) {
-        self.tx_log.lock().unwrap().clear();
-    }
-
-    fn last_sent_packet(&self) -> Option<Vec<u8>> {
-        self.tx_log.lock().unwrap().last().map(|(_, p)| p.clone())
-    }
-
-    /// Set packet loss probability (0.0 = no loss, 1.0 = drop all)
-    fn set_drop_probability(&self, probability: f32) {
-        let prob = probability.max(0.0).min(1.0);
-        *self.drop_probability.lock().unwrap() = prob;
-        println!("📉 Packet loss probability set to {:.1}%", prob * 100.0);
-    }
-}
-
-impl Device for MockDevice {
-    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut queue = self.rx_queue.lock().unwrap();
-        match queue.pop_front() {
-            Some(packet) => {
-                let len = packet.len().min(buf.len());
-                buf[..len].copy_from_slice(&packet[..len]);
-                Ok(len)
-            }
-            None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-        }
-    }
-
-    fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        // Check if we should drop this packet
-        let drop_probability = *self.drop_probability.lock().unwrap();
-        if drop_probability > 0.0 && rand::random::<f32>() < drop_probability {
-            println!("🔥 DROPPING outgoing packet (simulation)");
-            // Return success but don't log - simulates packet loss
-            return Ok(buf.len());
-        }
-
-        let packet = buf.to_vec();
-        let len = packet.len(); // Save length before move
-
-        if let Ok(ip) = Ipv4HeaderSlice::from_slice(buf) {
-            if ip.protocol() == IpNumber::TCP {
-                if let Ok(tcp) = TcpHeaderSlice::from_slice(&buf[ip.slice().len()..]) {
-                    let flags_str = format!(
-                        "{}{}{}{}{}",
-                        if tcp.syn() { "S" } else { "-" },
-                        if tcp.ack() { "A" } else { "-" },
-                        if tcp.fin() { "F" } else { "-" },
-                        if tcp.rst() { "R" } else { "-" },
-                        if tcp.psh() { "P" } else { "-" },
-                    );
-                    let desc = format!(
-                        "{}:{} → {}:{} [{}] seq={} ack={}",
-                        ip.source_addr(),
-                        tcp.source_port(),
-                        ip.destination_addr(),
-                        tcp.destination_port(),
-                        flags_str,
-                        tcp.sequence_number(),
-                        tcp.acknowledgment_number()
-                    );
-                    println!("📤 SEND: {} ({} bytes)", desc, len);
-                    self.tx_log.lock().unwrap().push((desc, packet));
-                    return Ok(len);
-                }
-            }
-        }
-        self.tx_log
-            .lock()
-            .unwrap()
-            .push(("Unknown".to_string(), packet));
-        Ok(len)
-    }
-}
-
-// Helper to create various packet types
-struct PacketFactory;
-
-impl PacketFactory {
-    fn syn(src: &str, dst: &str, src_port: u16, dst_port: u16, seq: u32) -> Vec<u8> {
-        let src_ip: Ipv4Addr = src.parse().unwrap();
-        let dst_ip: Ipv4Addr = dst.parse().unwrap();
-
-        let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
-            .tcp(src_port, dst_port, seq, 65535)
-            .syn();
-
-        let mut packet = Vec::with_capacity(builder.size(0));
-        builder.write(&mut packet, &[]).unwrap();
-        packet
-    }
-
-    fn ack(src: &str, dst: &str, src_port: u16, dst_port: u16, seq: u32, ack: u32) -> Vec<u8> {
-        let src_ip: Ipv4Addr = src.parse().unwrap();
-        let dst_ip: Ipv4Addr = dst.parse().unwrap();
-
-        let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
-            .tcp(src_port, dst_port, seq, 65535)
-            .ack(ack);
-
-        let mut packet = Vec::with_capacity(builder.size(0));
-        builder.write(&mut packet, &[]).unwrap();
-        packet
-    }
-
-    fn data(
-        src: &str,
-        dst: &str,
-        src_port: u16,
-        dst_port: u16,
-        seq: u32,
-        ack: u32,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let src_ip: Ipv4Addr = src.parse().unwrap();
-        let dst_ip: Ipv4Addr = dst.parse().unwrap();
-
-        let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
-            .tcp(src_port, dst_port, seq, 65535)
-            .psh()
-            .ack(ack);
-
-        let mut packet = Vec::with_capacity(builder.size(data.len()));
-        builder.write(&mut packet, data).unwrap();
-        packet
-    }
-
-    fn fin(src: &str, dst: &str, src_port: u16, dst_port: u16, seq: u32, ack: u32) -> Vec<u8> {
-        let src_ip: Ipv4Addr = src.parse().unwrap();
-        let dst_ip: Ipv4Addr = dst.parse().unwrap();
-
-        let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
-            .tcp(src_port, dst_port, seq, 65535)
-            .fin()
-            .ack(ack);
-
-        let mut packet = Vec::with_capacity(builder.size(0));
-        builder.write(&mut packet, &[]).unwrap();
-        packet
-    }
-}
-
-// Helper to parse packets for assertions
-fn parse_tcp_packet(packet: &[u8]) -> (Ipv4HeaderSlice, TcpHeaderSlice) {
-    let ip = Ipv4HeaderSlice::from_slice(packet).unwrap();
-    let tcp = TcpHeaderSlice::from_slice(&packet[ip.slice().len()..]).unwrap();
-    (ip, tcp)
+    (key, server_seq)
 }
 
 // Now the actual tests
@@ -276,26 +92,6 @@ fn test_echo_single_line() {
             .len();
     let echoed_data = &echo.1[payload_offset..];
     assert_eq!(echoed_data, b"hello\n", "Expected echoed data to match");
-}
-
-// Helper function to establish a connection
-fn establish_connection(mock: &MockDevice, server: &mut Server) -> (TcpKey, u32) {
-    // SYN
-    let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, 1000);
-    server.handle_packet(&syn);
-
-    // Get SYN-ACK details
-    let syn_ack = mock.last_sent_packet().unwrap();
-    let (ip_hdr, tcp_hdr) = parse_tcp_packet(&syn_ack);
-    let key = TcpKey::new(&ip_hdr, &tcp_hdr);
-    let server_seq = tcp_hdr.sequence_number();
-
-    // ACK
-    let ack = PacketFactory::ack("10.0.0.2", "10.0.0.1", 12345, 80, 1001, server_seq + 1);
-    server.handle_packet(&ack);
-    mock.clear_sent(); // Clear handshake packets for cleaner test output
-
-    (key, server_seq)
 }
 
 #[test]
@@ -567,7 +363,7 @@ fn test_retransmission_abandon_after_max() {
 
 #[test]
 fn lost_syn_ack_then_success() {
-    use crate::tcp::{TcpState, MAX_RETRANSMISSIONS};
+    use crate::tcp::{State, MAX_RETRANSMISSIONS};
 
     let dev = MockDevice::new();
     let clock = Arc::new(MockClock::new(Instant::now()));
@@ -577,7 +373,7 @@ fn lost_syn_ack_then_success() {
     let syn = PacketFactory::syn("10.0.0.2", "10.0.0.1", 12345, 80, /*seq*/ 1000);
     server.handle_packet(&syn);
 
-    let cli_srv_key = TcpKey::new_for_test("10.0.0.2", 12345, "10.0.0.1", 80);
+    let cli_srv_key = Key::new_for_test("10.0.0.2", 12345, "10.0.0.1", 80);
 
     // make the SYN-ACK RTO tiny so the test runs fast
     let tiny_rto = Duration::from_millis(20);
@@ -620,7 +416,7 @@ fn lost_syn_ack_then_success() {
     );
     server.handle_packet(&final_ack);
     let snapshot = server.peek_conn(&cli_srv_key).expect("expected connection");
-    assert_eq!(snapshot.state, TcpState::Established, "handshake completed");
+    assert_eq!(snapshot.state, State::Established, "handshake completed");
     assert!(
         snapshot.retransmits == 0,
         "retransmit queue must be empty after ACK arrives"

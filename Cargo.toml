@@ -11,5 +11,5 @@ nix = { version = "0.30", features = ["socket", "net"] }
 libc = "0.2"
 
 [[bin]]
-name = "server"
+name = "hyperwire"
 path = "src/main.rs"

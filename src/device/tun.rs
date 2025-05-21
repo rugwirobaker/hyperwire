@@ -1,9 +1,5 @@
+use crate::Device;
 use std::io;
-
-pub trait Device {
-    fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
-    fn send(&self, buf: &[u8]) -> io::Result<usize>;
-}
 
 // Tun wraps a real tun device
 pub struct Tun {
